@@ -1,16 +1,18 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdtemp, readdir, rmdir } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { readdir } from "node:fs/promises";
+import { resolve } from "node:path";
 import { promisify } from "node:util";
 import { Client } from "@modelcontextprotocol/client";
 import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
 import { toolContract } from "../dist/contracts/toolContracts.js";
-import { hashStableFile } from "../dist/filesystem/StableFileHash.js";
-import { OwnedRegularFileCleanupFailure } from "../dist/filesystem/RegularFile.js";
-import { mcpTextValue } from "./lib/mcp-verifier-results.mjs";
-import { closeVerifierResources } from "./lib/verifier-cleanup.mjs";
+import { ArtifactResourceScope } from "../dist/resources/ArtifactResourceScope.js";
+import { requireMcpOutput } from "./lib/mcp-verifier-results.mjs";
+import { hashVerifierFile } from "./lib/verifier-file-resources.mjs";
+import {
+  VerifierFixture,
+  withVerifierFixture,
+} from "./lib/verifier-fixture.mjs";
 
 const args = process.argv.slice(2);
 if (args.includes("--help") || args.includes("-h")) {
@@ -24,7 +26,12 @@ if (!(args.length === 0 || (args.length === 2 && args[0] === "--pcap")))
 const path = args[1] === undefined ? null : resolve(args[1]);
 // This parent is shared by independent CLI/MCP owners. A leased Windows
 // runtime root would prevent their native admission of its directory handle.
-const root = await mkdtemp(join(tmpdir(), "rea-pcap-verifier-"));
+const fixture = await VerifierFixture.open({
+  prefix: "rea-pcap-verifier-",
+  private: false,
+});
+const root = fixture.path;
+const resources = new ArtifactResourceScope();
 const environment = Object.fromEntries(
   Object.entries(process.env).filter(([, value]) => typeof value === "string"),
 );
@@ -36,32 +43,32 @@ Object.assign(environment, {
 const entrypoint = resolve("scripts/rea.mjs");
 const execute = promisify(execFile);
 const client = new Client({ name: "pcap-real-verifier", version: "1" });
-let primaryError;
 const transport = new StdioClientTransport({
   command: process.execPath,
   args: [entrypoint, "mcp"],
   env: environment,
   stderr: "pipe",
 });
-const hashOwners = new Map();
-const hashOwned = async (...args) => {
-  try {
-    return await hashStableFile(...args);
-  } catch (cause) {
-    if (cause instanceof OwnedRegularFileCleanupFailure)
-      hashOwners.set(cause.owner, cause.path);
-    throw cause;
-  }
-};
 transport.stderr?.resume();
-try {
+fixture.releaseAfter(() => client.close());
+fixture.releaseAfter(() => transport.close());
+fixture.releaseAfter(() => resources.close());
+// The product releases what it created under TMPDIR; anything left fails.
+fixture.releaseAfter(async () =>
+  assert.deepEqual(
+    await readdir(root),
+    [],
+    `Owned capture resources remain under ${root}`,
+  ),
+);
+await withVerifierFixture(fixture, async () => {
   await client.connect(transport);
   const readiness = await run("inspect_pcap_client", {});
   assert(readiness.client.tshark_version && readiness.client.capinfos_version);
   if (path === null)
     console.log("[unverified] Capture inspection: no --pcap was supplied");
   else {
-    const identity = await hashOwned(path);
+    const identity = await hashVerifierFile(path, resources);
     const result = await run("inspect_pcap_capture", { path });
     assert.deepEqual(result.target, { path, ...identity });
     assert(result.packet_count >= 0);
@@ -86,9 +93,11 @@ try {
         (entry) =>
           entry.response_address_count > entry.response_addresses.length,
       );
-    assert.equal(result.coverage, partial ? "partial" : "complete");
+    // Count discrepancies prove partial coverage, but matching counts do not
+    // rule out unresolved HTTP targets or unavailable DNS identity extraction.
+    if (partial) assert.equal(result.coverage, "partial");
     assert.deepEqual(
-      await hashOwned(path),
+      await hashVerifierFile(path, resources),
       identity,
       "Input capture must remain unchanged",
     );
@@ -96,37 +105,7 @@ try {
       `[ok] ${result.packet_count} packets; ${result.endpoint_count} addresses; coverage=${result.coverage}`,
     );
   }
-} catch (cause) {
-  primaryError = cause;
-  throw cause;
-} finally {
-  const cleanup = [];
-  for (const [owner, path] of hashOwners) {
-    cleanup.push(async () => {
-      try {
-        await owner.close();
-        hashOwners.delete(owner);
-      } catch (cause) {
-        throw new Error(`Could not close hash file handle for ${path}`, {
-          cause,
-        });
-      }
-    });
-  }
-  cleanup.push(async () => {
-    await closeVerifierResources([
-      () => client.close(),
-      () => transport.close(),
-    ]);
-    assert.deepEqual(
-      await readdir(root),
-      [],
-      `Owned capture resources remain under ${root}`,
-    );
-    await rmdir(root);
-  });
-  await closeVerifierResources(cleanup, primaryError);
-}
+});
 console.log("All asserted pcap CLI/MCP checks passed");
 
 async function run(name, input) {
@@ -146,14 +125,13 @@ async function run(name, input) {
     { name, arguments: input },
     { timeout: 360_000 },
   );
-  assert.notEqual(response.isError, true, mcpTextValue(response));
-  const mcp = contract.outputSchema.parse(JSON.parse(mcpTextValue(response)));
+  const mcp = requireMcpOutput(response, name, contract);
   assert.deepEqual(mcp.normalized_result, cli.normalized_result);
   assert.deepEqual(mcp.subject, cli.subject);
   if (input.path !== undefined) {
     assert.equal(cli.subject.local_path, input.path);
     assert.equal(
-      cli.subject.digest.sha256,
+      cli.subject.identity.sha256,
       cli.normalized_result.target.sha256,
     );
   }

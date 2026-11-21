@@ -1,24 +1,12 @@
 import { describe, expect, it } from "vitest";
 
-import { executableFormatHintSchema } from "./dosCom.js";
 import {
   admitRawBinary,
   parseRawBinaryEntryPoint,
   rawBinarySelectionError,
-  validateRawBinaryLength,
 } from "./rawBinary.js";
 
-describe("headerless format hints", () => {
-  it("admits dos-com and raw-binary names only", () => {
-    expect(executableFormatHintSchema.safeParse("dos-com").success).toBe(true);
-    expect(executableFormatHintSchema.safeParse("raw-binary").success).toBe(
-      true,
-    );
-    expect(executableFormatHintSchema.safeParse("raw").success).toBe(false);
-  });
-});
-
-describe("raw-binary entry addresses", () => {
+describe("headerless entry points", () => {
   it("canonicalizes equivalent hex spellings without dropping the source", () => {
     const parsed = parseRawBinaryEntryPoint("0x08000000");
     expect(parsed).toEqual({
@@ -33,7 +21,10 @@ describe("raw-binary entry addresses", () => {
   it.each(["8000000", "0x", "0xgg", "0X8000000", ""])(
     "rejects malformed entry %s",
     (value) => {
-      expect(parseRawBinaryEntryPoint(value).ok).toBe(false);
+      expect(parseRawBinaryEntryPoint(value)).toEqual({
+        ok: false,
+        error: "entry_point must be a hexadecimal address of the form 0x…",
+      });
     },
   );
 });
@@ -94,7 +85,6 @@ describe("raw-binary admission", () => {
     });
   });
   it("rejects an empty file as a target refusal while naming the extent", () => {
-    expect(validateRawBinaryLength(0).ok).toBe(false);
     const result = admitRawBinary({
       architecture: "x86",
       entryPoint: "0x1000",
@@ -114,7 +104,6 @@ describe("raw-binary admission", () => {
       entryPoint: "0xfffffffc",
       fileBytes: 8,
     });
-    expect(result.ok).toBe(false);
     if (result.ok) throw new Error("expected overflow rejection");
     expect(result.error.reason).toContain("arm address width");
     expect(result.error.constraint).toBe("load_selection_rejected");
@@ -137,7 +126,11 @@ describe("raw-binary admission", () => {
         ).toEqual({
           ok: false,
           error: {
-            reason: `raw-binary ${architecture} entry_point ${entryPoint} must be 4-byte aligned`,
+            reason: `raw-binary ${architecture} entry_point ${entryPoint} must be 4-byte aligned${
+              architecture === "arm" && entryPoint !== "0x8000002"
+                ? "; an odd address can be a Thumb function pointer with bit 0 set, but raw-binary arm decodes ARM state only, so a Thumb entry is unsupported and the entry was not adjusted"
+                : ""
+            }`,
             constraint: "load_selection_rejected",
           },
         });
@@ -151,9 +144,9 @@ describe("raw-binary admission", () => {
       "missing architecture",
       { architecture: undefined, entryPoint: "0x8000000" },
     ],
+    ["mismatched family name", { architecture: "68000", entryPoint: "0x1000" }],
   ])("classifies a %s as caller input", (_name, selection) => {
     const result = admitRawBinary({ ...selection, fileBytes: 4 });
-    expect(result.ok).toBe(false);
     if (result.ok) throw new Error("expected caller-input rejection");
     expect(result.error.constraint).toBe("load_selection_rejected");
   });
@@ -167,6 +160,59 @@ describe("raw-binary admission", () => {
       });
       if (!admitted.ok) throw new Error(admitted.error.reason);
       expect(admitted.value.entryPoint).toBe("0x1001");
+    },
+  );
+});
+
+describe("m68k raw-binary admission", () => {
+  it("admits even m68k entries up to the 32-bit address boundary", () => {
+    for (const [entryPoint, fileBytes] of [
+      ["0x0", 8],
+      ["0x1000", 8],
+      ["0xfffffffe", 2],
+    ] as const) {
+      const result = admitRawBinary({
+        architecture: "m68k",
+        entryPoint,
+        fileBytes,
+      });
+      if (!result.ok) throw new Error(result.error.reason);
+      expect(result.value).toEqual({
+        architecture: "m68k",
+        entryPoint,
+        entryPointSource: entryPoint,
+      });
+    }
+  });
+  it.each(["0x1", "0x1001", "0x1003", "0xffffffff"])(
+    "rejects the odd m68k entry %s before provider selection",
+    (entryPoint) => {
+      expect(
+        admitRawBinary({ architecture: "m68k", entryPoint, fileBytes: 2 }),
+      ).toEqual({
+        ok: false,
+        error: {
+          reason: `raw-binary m68k entry_point ${entryPoint} must be 2-byte aligned`,
+          constraint: "load_selection_rejected",
+        },
+      });
+    },
+  );
+  it.each([
+    ["0x100000000", 2],
+    ["0xfffffffe", 4],
+  ])(
+    "rejects an m68k mapping at %s with %i bytes that exceeds 32 bits",
+    (entryPoint, fileBytes) => {
+      expect(
+        admitRawBinary({ architecture: "m68k", entryPoint, fileBytes }),
+      ).toEqual({
+        ok: false,
+        error: {
+          reason: `raw-binary mapping from ${entryPoint} must fit in the m68k address width`,
+          constraint: "load_selection_rejected",
+        },
+      });
     },
   );
 });

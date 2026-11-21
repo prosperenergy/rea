@@ -1,9 +1,14 @@
-import { rm, writeFile } from "node:fs/promises";
+import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 
 import { expect, it, onTestFinished, vi } from "vitest";
 
+import { CdpCommandRejection } from "../../../src/browser/CdpCommandRejection.js";
+import { CdpConnection } from "../../../src/browser/CdpConnection.js";
+import { AnalysisError } from "../../../src/domain/analysisErrorBase.js";
+import { AnalysisCancelledError } from "../../../src/domain/analysisErrorCore.js";
+import { inspectWebPageInputSchema } from "../../../src/domain/browserObservation.js";
 import { CdpBrowserProvider } from "../../../src/browser/CdpBrowserProvider.js";
 import { CdpElectronProvider } from "../../../src/browser/CdpElectronProvider.js";
 import { observeWebSessionInputSchema } from "../../../src/domain/browserSession.js";
@@ -11,6 +16,7 @@ import { analyzeWebBundleInputSchema } from "../../../src/domain/webBundleAnalys
 import { inspectElectronPageInputSchema } from "../../../src/domain/javascript/electronObservation.js";
 import { createTestTempDirectory } from "../../fixtures/temporaryDirectory.js";
 import { startFakeCdpBrowser } from "../../fixtures/fakeCdpBrowser.js";
+import { waitFor } from "../../support/testWait.js";
 
 it.each(["Page.disable", "Target.detachFromTarget"])(
   "finishes caller cancellation even when %s has no response",
@@ -48,7 +54,7 @@ it.each(["Page.disable", "Target.detachFromTarget"])(
     expect(methods).toContain("Target.detachFromTarget");
     expect(methods).not.toContain("Target.closeTarget");
     expect(methods).not.toContain("Browser.close");
-    await vi.waitFor(() => expect(browser.activeConnectionCount()).toBe(0));
+    await waitFor(() => expect(browser.activeConnectionCount()).toBe(0));
   },
 );
 
@@ -67,7 +73,7 @@ it("releases cleanup when cancellation arrives after capture completes", async (
     }),
     { signal: controller.signal },
   );
-  await vi.waitFor(() => {
+  await waitFor(() => {
     expect(
       browser.commands.some(({ method }) => method === "Page.disable"),
     ).toBe(true);
@@ -84,7 +90,7 @@ it("releases cleanup when cancellation arrives after capture completes", async (
   expect(browser.commands.map(({ method }) => method)).toContain(
     "Target.detachFromTarget",
   );
-  await vi.waitFor(() => expect(browser.activeConnectionCount()).toBe(0));
+  await waitFor(() => expect(browser.activeConnectionCount()).toBe(0));
   const methods = browser.commands.map(({ method }) => method);
   expect(methods).not.toContain("Target.closeTarget");
   expect(methods).not.toContain("Browser.close");
@@ -127,7 +133,7 @@ it("retains the page inspection when bundle cleanup is cancelled", async () => {
       },
     },
   });
-  await vi.waitFor(() => expect(browser.activeConnectionCount()).toBe(0));
+  await waitFor(() => expect(browser.activeConnectionCount()).toBe(0));
 });
 
 it("closes an Electron inspection session when cleanup is cancelled", async () => {
@@ -140,7 +146,6 @@ it("closes an Electron inspection session when cleanup is cancelled", async () =
   });
   onTestFinished(async () => {
     await browser.close();
-    await rm(root, { recursive: true, force: true });
   });
   const controller = new AbortController();
   const pending = new CdpElectronProvider().inspectPage(
@@ -179,7 +184,7 @@ it("closes an Electron inspection session when cleanup is cancelled", async () =
   expect(methods).toContain("Target.detachFromTarget");
   expect(methods).not.toContain("Target.closeTarget");
   expect(methods).not.toContain("Browser.close");
-  await vi.waitFor(() => expect(browser.activeConnectionCount()).toBe(0));
+  await waitFor(() => expect(browser.activeConnectionCount()).toBe(0));
   expect((await fetch(`${browser.endpoint}/json/version`)).ok).toBe(true);
 });
 
@@ -199,7 +204,6 @@ it("classifies cancellation that arrives during final Electron detach", async ()
   });
   onTestFinished(async () => {
     await browser.close();
-    await rm(root, { recursive: true, force: true });
   });
 
   const result = await new CdpElectronProvider().inspectPage(
@@ -217,8 +221,12 @@ it("classifies cancellation that arrives during final Electron detach", async ()
       _tag: "AnalysisCancelledError",
       operation: "inspect_electron_page",
       partialObservation: {
-        target: { target_id: "electron-page", file_path: page },
-        dom: { total_nodes: expect.any(Number) },
+        kind: "electron-page-observation",
+        cleanup: "transport-closed",
+        inspection: {
+          target: { target_id: "electron-page", file_path: page },
+          dom: { total_nodes: expect.any(Number) },
+        },
       },
     },
   });
@@ -227,6 +235,103 @@ it("classifies cancellation that arrives during final Electron detach", async ()
   expect(methods).toContain("Target.detachFromTarget");
   expect(methods).not.toContain("Target.closeTarget");
   expect(methods).not.toContain("Browser.close");
-  await vi.waitFor(() => expect(browser.activeConnectionCount()).toBe(0));
+  await waitFor(() => expect(browser.activeConnectionCount()).toBe(0));
   expect((await fetch(`${browser.endpoint}/json/version`)).ok).toBe(true);
 });
+
+it.each(
+  (["browser", "electron"] as const).flatMap((kind) =>
+    (["completed", "failed", "attach-failed"] as const).map((outcome) => ({
+      kind,
+      outcome,
+    })),
+  ),
+)(
+  "resolves $kind $outcome inspection and cleanup composition after confirmed socket retry",
+  async ({ kind, outcome }) => {
+    const root = await createTestTempDirectory("rea-cdp-cleanup-binding-");
+    const page = join(root, "index.html");
+    await writeFile(page, "<main>completed fixture</main>");
+    const browser = await startFakeCdpBrowser({
+      ...(kind === "electron"
+        ? { electronFileUrl: pathToFileURL(page).href }
+        : {}),
+      commandError(command) {
+        return (outcome === "failed" &&
+          command.method === "Page.getFrameTree") ||
+          (outcome === "attach-failed" &&
+            command.method === "Target.attachToTarget")
+          ? { code: -32_000, message: "controlled primary frame read failure" }
+          : undefined;
+      },
+    });
+    const provider =
+      kind === "browser" ? new CdpBrowserProvider() : new CdpElectronProvider();
+    const controller = new AbortController();
+    const reason = new Error("cancel during failed transport close");
+    const originalClose = CdpConnection.prototype.close;
+    let denied = true;
+    const closing = vi
+      .spyOn(CdpConnection.prototype, "close")
+      .mockImplementation(function (this: CdpConnection) {
+        if (!denied) return originalClose.call(this);
+        controller.abort(reason);
+        return Promise.reject(new Error("controlled transport close failure"));
+      });
+    onTestFinished(async () => {
+      closing.mockRestore();
+      await provider.close();
+      await browser.close();
+    });
+    const result =
+      provider instanceof CdpBrowserProvider
+        ? await provider.inspectPage(
+            inspectWebPageInputSchema.parse({
+              cdp_endpoint: browser.endpoint,
+              target_id: "allowed-page",
+              allowed_origins: [browser.allowedOrigin],
+              observation_ms: 0,
+            }),
+            { signal: controller.signal },
+          )
+        : await provider.inspectPage(
+            inspectElectronPageInputSchema.parse({
+              cdp_endpoint: browser.endpoint,
+              target_id: "electron-page",
+              observation_ms: 0,
+            }),
+            { signal: controller.signal },
+          );
+    if (result.ok)
+      throw new Error("Expected cancelled inspection with unresolved cleanup");
+    expect(result.error.cleanupIncomplete).toBe(true);
+    if (outcome === "completed")
+      expect(result.error.partialObservation).toBeDefined();
+    const observation = result.error.partialObservation;
+    const aggregate = result.error.cause;
+    if (!(aggregate instanceof AggregateError))
+      throw new Error("Missing cancellation/cleanup aggregate");
+    const primary = aggregate.errors[0];
+    if (outcome === "completed") {
+      expect(primary).toBeInstanceOf(AnalysisCancelledError);
+      expect(primary.cause).toBe(reason);
+    } else {
+      expect(primary).toBeInstanceOf(CdpCommandRejection);
+      expect(primary.reportedMessage).toBe(
+        "controlled primary frame read failure",
+      );
+    }
+    const primaryCause = primary.cause;
+    const retry = await provider.close().catch((cause: unknown) => cause);
+    if (!(retry instanceof AnalysisError))
+      throw new Error("Missing typed retry failure");
+    expect(retry.cleanupIncomplete).toBe(true);
+    denied = false;
+    await provider.close();
+    await waitFor(() => expect(browser.activeConnectionCount()).toBe(0));
+    expect(result.error.cleanupIncomplete).toBe(false);
+    expect(retry.cleanupIncomplete).toBe(false);
+    expect(result.error.partialObservation).toBe(observation);
+    expect(primary.cause).toBe(primaryCause);
+  },
+);

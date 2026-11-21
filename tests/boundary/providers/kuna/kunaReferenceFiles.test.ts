@@ -1,10 +1,16 @@
-import { expect, it } from "vitest";
+import { Readable } from "node:stream";
+import { pipeline } from "node:stream/promises";
+import * as v8 from "node:v8";
+
+import { expect, it, vi } from "vitest";
 
 import { normalizeKunaAddress } from "../../../../src/kuna/KunaAddress.js";
 import {
-  parseKunaCallGraph,
+  KunaCallGraphReader,
   parseKunaIncomingReferences,
 } from "../../../../src/kuna/KunaReferenceFiles.js";
+
+vi.mock("node:v8", { spy: true });
 
 const input = "/snapshot/program";
 // Fixture-only numeric placeholders preserve decimal u64 tokens in JSON text.
@@ -44,8 +50,19 @@ const graph = () => ({
   ],
 });
 
-it("preserves u64 numeric tokens and excludes non-call edges", () => {
-  const result = parseKunaCallGraph(wire(graph()), input);
+/** Stream a graph through the reader in small pieces, as Kuna's stdout arrives. */
+const parseKunaCallGraph = async (text: string, selected: string) => {
+  const bytes = Buffer.from(text);
+  const chunks: Buffer[] = [];
+  for (let offset = 0; offset < bytes.byteLength; offset += 7)
+    chunks.push(bytes.subarray(offset, offset + 7));
+  const reader = new KunaCallGraphReader();
+  await pipeline(Readable.from(chunks), reader);
+  return reader.finish(selected);
+};
+
+it("preserves u64 numeric tokens and excludes non-call edges", async () => {
+  const result = await parseKunaCallGraph(wire(graph()), input);
   expect(result.ok).toBe(true);
   if (!result.ok) return;
   expect([...result.value.nodes.keys()]).toEqual([
@@ -62,9 +79,9 @@ it("preserves u64 numeric tokens and excludes non-call edges", () => {
   expect(result.value.callers.has("0x1")).toBe(false);
 });
 
-it("keeps a forwarding instruction address separate from function identity", () => {
+it("keeps a forwarding instruction address separate from function identity", async () => {
   const value = graph();
-  const result = parseKunaCallGraph(
+  const result = await parseKunaCallGraph(
     wire({
       ...value,
       functions: value.functions.map((fn, index) =>
@@ -135,16 +152,21 @@ it.each([
   ],
 ] as const)(
   "rejects graph %s rather than returning an empty relationship set",
-  (_name, mutate) => {
+  async (_name, mutate) => {
     const value = graph();
     mutate(value);
-    expect(parseKunaCallGraph(wire(value), input).ok).toBe(false);
+    expect(await parseKunaCallGraph(wire(value), input)).toMatchObject({
+      ok: false,
+      error: { _tag: "AnalysisOutputError", operation: "kuna:call-graph" },
+    });
   },
 );
 
-it("rejects unrequested bodies and a document for a different input", () => {
+it("rejects unrequested bodies and a document for a different input", async () => {
   const value = graph();
-  expect(parseKunaCallGraph(wire(value), "/other/program").ok).toBe(false);
+  expect((await parseKunaCallGraph(wire(value), "/other/program")).ok).toBe(
+    false,
+  );
   const body = {
     ...value,
     functions: value.functions.map((fn) => ({
@@ -152,7 +174,82 @@ it("rejects unrequested bodies and a document for a different input", () => {
       codeC: "must not be materialized as reference data",
     })),
   };
-  expect(parseKunaCallGraph(wire(body), input).ok).toBe(false);
+  expect(await parseKunaCallGraph(wire(body), input)).toMatchObject({
+    ok: false,
+    error: {
+      reason: "row_must_be_null",
+      diagnostics: { member: "functions", field: "codeC" },
+    },
+  });
+});
+
+it("admits the edge index while edges stream and refuses it under low headroom", async () => {
+  const nodes = Array.from({ length: 300 }, (_, index) =>
+    node(String(index + 1), `f${String(index)}`),
+  );
+  const edges = Array.from({ length: 3000 }, (_, index) => ({
+    callerAddress: `@${String((index % 10) + 1)}`,
+    calleeAddress: `@${String(Math.floor(index / 10) + 1)}`,
+    kind: "call",
+    calleeOrder: Math.floor(index / 10),
+  }));
+  const text = wire({
+    schemaVersion: 4,
+    binary: { sourcePath: input, functionCount: 300, edgeCount: 3000 },
+    functions: nodes,
+    edges,
+  });
+  expect(await parseKunaCallGraph(text, input)).toMatchObject({
+    ok: true,
+    value: { edgeCount: 3000 },
+  });
+  const heap = v8.getHeapStatistics();
+  let samples = 0;
+  // Headroom runs out after the node rows have been admitted.
+  vi.mocked(v8.getHeapStatistics).mockImplementation(() => ({
+    ...heap,
+    total_available_size:
+      (samples += 1) <= 2 ? heap.total_available_size : 1024,
+  }));
+  try {
+    const refused = await parseKunaCallGraph(text, input);
+    expect(refused).toMatchObject({
+      ok: false,
+      error: {
+        _tag: "AnalysisResourceConstraintError",
+        resource: "memory",
+      },
+    });
+    if (refused.ok) return;
+    const retained = (
+      refused.error as unknown as {
+        reportedLimits: { retained_rows: number };
+      }
+    ).reportedLimits.retained_rows;
+    expect(retained).toBeGreaterThan(nodes.length);
+    expect(retained).toBeLessThan(nodes.length + edges.length);
+  } finally {
+    vi.mocked(v8.getHeapStatistics).mockReset();
+  }
+});
+
+it("skips fields it does not interpret, including nested parameters", async () => {
+  const value = graph();
+  const result = await parseKunaCallGraph(
+    wire({
+      ...value,
+      binary: { ...value.binary, name: "program", analysisImageBase: 0 },
+      functions: value.functions.map((fn) => ({
+        ...fn,
+        size: 16,
+        parameters: [{ name: "a0", type: "int" }],
+        signature: "int f(int a0)",
+        isEntryPoint: false,
+      })),
+    }),
+    input,
+  );
+  expect(result).toMatchObject({ ok: true, value: { edgeCount: 2 } });
 });
 
 const identity = (name: string, value: number) => ({
@@ -189,6 +286,226 @@ it("keeps exact endpoints, deduplicates sites and counts excluded forwarding ali
   });
 });
 
+it("preserves pointer and walk coverage separately and rejects inconsistent pointer identity", () => {
+  const pointer = {
+    kind: "pointer",
+    from_address: "@16384",
+    from_address_hex: "0x4000",
+    from_name: "slot",
+    to_address: "@8192",
+    to_address_hex: "0x2000",
+    to_name: "callee",
+    width: 8,
+    source: "chained-fixups",
+  };
+  const source = {
+    ...xrefs(),
+    coverage: {
+      decoded: true,
+      section: "__TEXT,__text",
+      code_section: true,
+      executable: true,
+      unwalked: [
+        {
+          name: "middle",
+          address: "@20480",
+          address_hex: "0x5000",
+          section: "__TEXT,__const",
+        },
+      ],
+      notes: ["middle was not walked"],
+    },
+    data_refs_coverage: "chained-fixups",
+    data_refs_count: 1,
+    data_refs: [pointer],
+  };
+  expect(
+    parseKunaIncomingReferences(wire(source), input, "0x2000"),
+  ).toMatchObject({
+    ok: true,
+    value: {
+      addresses: ["0x1004", "0x4000"],
+      pointerCoverage: "chained-fixups",
+      pointers: [
+        {
+          from_address: "0x4000",
+          to_address: "0x2000",
+          source: "chained-fixups",
+        },
+      ],
+      walkCoverage: { unwalked: [{ address: "0x5000" }] },
+    },
+  });
+  pointer.to_address_hex = "0x2001";
+  expect(
+    parseKunaIncomingReferences(wire(source), input, "0x2000"),
+  ).toMatchObject({
+    ok: false,
+    error: { code: "xref_endpoints" },
+  });
+});
+
+it("counts pointer rows excluded because they target a forwarding alias", () => {
+  const pointer = (from: number, to: number) => ({
+    kind: "pointer",
+    from_address: `@${from}`,
+    from_address_hex: `0x${from.toString(16)}`,
+    from_name: null,
+    to_address: `@${to}`,
+    to_address_hex: `0x${to.toString(16)}`,
+    to_name: null,
+    width: 8,
+    source: "dynamic-relocations",
+  });
+  const source = {
+    ...xrefs(),
+    data_refs_coverage: "dynamic-relocations",
+    data_refs_count: 2,
+    data_refs: [pointer(16384, 8192), pointer(16392, 12288)],
+  };
+  expect(
+    parseKunaIncomingReferences(wire(source), input, "0x2000"),
+  ).toMatchObject({
+    ok: true,
+    value: {
+      addresses: ["0x1004", "0x4000"],
+      rows: 5,
+      excludedAliasRows: 2,
+      targetAliases: [{ name: "slot", address: "0x3000" }],
+      pointers: [
+        { from_address: "0x4000", to_address: "0x2000" },
+        { from_address: "0x4008", to_address: "0x3000" },
+      ],
+    },
+  });
+});
+
+it("preserves full-width pointer and unwalked addresses without numeric rounding", () => {
+  const source = {
+    binary: input,
+    direction: "to",
+    count: 0,
+    target: {
+      name: null,
+      address: "@18446744073709551615",
+      address_hex: "0xffffffffffffffff",
+      aliases: [],
+    },
+    xrefs: [],
+    coverage: {
+      decoded: false,
+      section: null,
+      code_section: null,
+      executable: null,
+      unwalked: [
+        {
+          name: "candidate",
+          address: "@9007199254740993",
+          address_hex: "0x20000000000001",
+          section: ".text",
+        },
+      ],
+      notes: [],
+    },
+    data_refs_coverage: "dynamic-relocations",
+    data_refs_count: 1,
+    data_refs: [
+      {
+        kind: "pointer",
+        from_address: "@9007199254740995",
+        from_address_hex: "0x20000000000003",
+        from_name: null,
+        to_address: "@18446744073709551615",
+        to_address_hex: "0xffffffffffffffff",
+        to_name: null,
+        width: 8,
+        source: "dynamic-relocations",
+      },
+    ],
+  };
+  expect(
+    parseKunaIncomingReferences(wire(source), input, "0xffffffffffffffff"),
+  ).toMatchObject({
+    ok: true,
+    value: {
+      addresses: ["0x20000000000003"],
+      rows: 1,
+      excludedAliasRows: 0,
+      pointers: [
+        { from_address: "0x20000000000003", to_address: "0xffffffffffffffff" },
+      ],
+      walkCoverage: { unwalked: [{ address: "0x20000000000001" }] },
+    },
+  });
+});
+
+it("distinguishes unreported pointer coverage from an explicitly empty pointer list", () => {
+  const source = xrefs();
+  expect(
+    parseKunaIncomingReferences(wire(source), input, "0x2000"),
+  ).toMatchObject({
+    ok: true,
+    value: { pointerCoverage: null, pointers: null, walkCoverage: null },
+  });
+  expect(
+    parseKunaIncomingReferences(
+      wire({
+        ...source,
+        data_refs_coverage: "none",
+        data_refs_count: 0,
+        data_refs: [],
+      }),
+      input,
+      "0x2000",
+    ),
+  ).toMatchObject({
+    ok: true,
+    value: { pointerCoverage: "none", pointers: [], walkCoverage: null },
+  });
+});
+
+it("rejects partial or inconsistent pointer inventories rather than reporting them empty", () => {
+  const source = xrefs();
+  for (const fields of [
+    { data_refs: [] },
+    { data_refs_count: 0 },
+    { data_refs_count: 1, data_refs: [] },
+  ]) {
+    expect(
+      parseKunaIncomingReferences(
+        wire({ ...source, ...fields }),
+        input,
+        "0x2000",
+      ),
+    ).toEqual({
+      ok: false,
+      error: { code: "xref_count" },
+    });
+  }
+});
+
+it("preserves unknown coverage for an address outside known sections", () => {
+  const source = {
+    ...xrefs(),
+    coverage: {
+      decoded: false,
+      section: null,
+      code_section: null,
+      executable: null,
+      unwalked: [],
+      notes: [],
+    },
+  };
+  expect(
+    parseKunaIncomingReferences(wire(source), input, "0x2000"),
+  ).toMatchObject({
+    ok: true,
+    value: {
+      walkCoverage: { section: null, code_section: null, executable: null },
+    },
+  });
+});
+
 it.each([
   [
     "count",
@@ -222,6 +539,21 @@ it.each([
     expect(parseKunaIncomingReferences(wire(value), input, "0x2000").ok).toBe(
       false,
     );
+  },
+);
+
+it.each([
+  ["not-an-address", "invalid_address"],
+  ["@18446744073709551616", "address_exceeds_u64"],
+] as const)(
+  "keeps the failed address field for incoming reference %s",
+  (token, code) => {
+    const value = xrefs();
+    value.xrefs[0]!.from_address = token;
+    expect(parseKunaIncomingReferences(wire(value), input, "0x2000")).toEqual({
+      ok: false,
+      error: { code, field: "from_address" },
+    });
   },
 );
 

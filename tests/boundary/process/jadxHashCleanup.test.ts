@@ -1,6 +1,8 @@
 import { expect, it, vi } from "vitest";
 
 import { OwnedFileHandle } from "../../../src/filesystem/OwnedFileHandle.js";
+import { RegularFileCleanupFailure } from "../../../src/filesystem/OwnedRegularFile.js";
+import { parseBinaryTarget } from "../../../src/application/BinaryTargetResolver.js";
 import { AnalysisError } from "../../../src/domain/analysisErrorBase.js";
 import {
   createJadxProtocolFixture,
@@ -8,8 +10,10 @@ import {
 } from "../../fixtures/android/jadx.js";
 
 it("resolves descriptor uncertainty after an immediate owned hash close retry", async () => {
-  const { service, apk, provider, launches } =
-    await createJadxProtocolFixture();
+  const { apk, provider, launches } = await createJadxProtocolFixture();
+  // Resolve admission before injecting the provider-owned hash close failure.
+  const target = await parseBinaryTarget(apk);
+  if (!target.ok) throw target.error;
   const cause = new Error("controlled hash close failure");
   const original = OwnedFileHandle.prototype.close;
   const owners: OwnedFileHandle[] = [];
@@ -21,15 +25,18 @@ it("resolves descriptor uncertainty after an immediate owned hash close retry", 
       await original.call(this);
     });
   try {
-    const result = await service.execute("inspect_android_package", {
-      path: apk,
+    const result = await provider.execute(target.value, {
+      operation: "inspect_android_package",
+      input: { path: apk },
     });
     if (result.ok) throw new Error("Expected the original close failure");
     expect(result.error.cleanupIncomplete).toBe(false);
     expect(result.error.cause).toBeInstanceOf(AggregateError);
-    expect((result.error.cause as AggregateError).errors).toEqual(
-      expect.arrayContaining([expect.objectContaining({ cause })]),
-    );
+    const primary = (result.error.cause as AggregateError).errors[0];
+    expect(primary).toBeInstanceOf(AnalysisError);
+    expect(primary.cause).toBeInstanceOf(RegularFileCleanupFailure);
+    expect(primary.cause.cleanupCause).toBe(cause);
+    expect(primary.cause.outcome.kind).toBe("completed");
     expect(owners).toHaveLength(2);
     expect(owners[0]).toBe(owners[1]);
     expect(owners[0]?.handle.fd).toBe(-1);
@@ -42,8 +49,10 @@ it("resolves descriptor uncertainty after an immediate owned hash close retry", 
 });
 
 it("keeps hash cleanup live until the exact retained descriptor closes", async () => {
-  const { service, apk, provider, launches } =
-    await createJadxProtocolFixture();
+  const { apk, provider, launches } = await createJadxProtocolFixture();
+  // Resolve admission before injecting the provider-owned hash close failure.
+  const target = await parseBinaryTarget(apk);
+  if (!target.ok) throw target.error;
   const cause = new Error("controlled persistent hash close failure");
   const original = OwnedFileHandle.prototype.close;
   const owners: OwnedFileHandle[] = [];
@@ -56,12 +65,15 @@ it("keeps hash cleanup live until the exact retained descriptor closes", async (
       await original.call(this);
     });
   try {
-    const result = await service.execute("inspect_android_package", {
-      path: apk,
+    const result = await provider.execute(target.value, {
+      operation: "inspect_android_package",
+      input: { path: apk },
     });
     if (result.ok) throw new Error("Expected retained descriptor cleanup");
     expect(result.error.cleanupIncomplete).toBe(true);
-    const primary = result.error.cause;
+    expect(result.error.cause).toBeInstanceOf(AggregateError);
+    const retirement = (result.error.cause as AggregateError).errors;
+    const primary = retirement[0];
     if (!(primary instanceof AnalysisError))
       throw new Error("Missing original typed hash failure");
     const originalCause = primary.cause;
@@ -72,6 +84,7 @@ it("keeps hash cleanup live until the exact retained descriptor closes", async (
     allowClose = true;
     await provider.close();
     expect(primary.cleanupIncomplete).toBe(false);
+    expect(result.error.cleanupIncomplete).toBe(false);
     expect(primary.cause).toBe(originalCause);
     expect(owners[0]?.handle.fd).toBe(-1);
     expect(launches).toHaveLength(0);

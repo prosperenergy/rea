@@ -1,21 +1,16 @@
-import { isAbsolute } from "node:path";
-import type { ExecutionOptions } from "../AnalysisProvider.js";
-import type { RecordedCrashPort } from "./RecordedCrashPort.js";
+import type { ExecutionOptions } from "../../ports/AnalysisProvider.js";
+import type { RecordedCrashPort } from "../../ports/binaryDiagnostics/RecordedCrashPort.js";
 import type { AnalysisError } from "../../domain/analysisErrorBase.js";
-import {
-  AnalysisCancelledError,
-  AnalysisInputError,
-  AnalysisOutputError,
-} from "../../domain/analysisErrorCore.js";
+import { AnalysisOutputError } from "../../domain/analysisErrorCore.js";
 import { createEvidence, type Evidence } from "../../domain/evidence.js";
 import {
   inspectRecordedCrashInputSchema,
   RECORDED_LINUX_CORE_PROFILES,
   recordedCrashSchema,
 } from "../../domain/native/recordedCrash.js";
-import { analysisInputErrorFromIssues } from "../../domain/inputIssueProjection.js";
-import { err, ok, type Result } from "../../domain/result.js";
+import { err, type Result } from "../../domain/result.js";
 import { completeProviderEvidence } from "../ProviderOperationExecution.js";
+import { parseAnalysisInput } from "../AnalysisInput.js";
 
 const OPERATION = "inspect_recorded_crash";
 
@@ -54,26 +49,14 @@ export class RecordedCrashService {
       input: Parameters<RecordedCrashPort["inspect"]>[0],
     ) => ReturnType<RecordedCrashPort["inspect"]>,
   ): Promise<Result<Evidence, AnalysisError>> {
-    if (options?.signal?.aborted)
-      return err(new AnalysisCancelledError(OPERATION));
-    const input = inspectRecordedCrashInputSchema.safeParse(rawInput);
-    if (!input.success)
-      return err(
-        analysisInputErrorFromIssues(OPERATION, input.error.issues, rawInput, {
-          cause: input.error,
-        }),
-      );
-    if (!isAbsolute(input.data.path))
-      return err(
-        new AnalysisInputError(OPERATION, undefined, [
-          {
-            path: ["path"],
-            reason: "invalid_format",
-            message: "Expected an absolute filesystem path on this host.",
-          },
-        ]),
-      );
-    const inspected = await inspect(input.data);
+    const input = parseAnalysisInput(
+      OPERATION,
+      rawInput,
+      inspectRecordedCrashInputSchema,
+      options?.signal,
+    );
+    if (!input.ok) return input;
+    const inspected = await inspect(input.value);
     if (!inspected.ok) return inspected;
     const diagnostics = recordedCrashSchema.shape.diagnostics.safeParse(
       inspected.value.diagnostics,
@@ -84,9 +67,9 @@ export class RecordedCrashService {
     const report = recordedCrashSchema.safeParse(inspected.value);
     if (
       !report.success ||
-      report.data.artifact.path !== input.data.path ||
+      report.data.artifact.path !== input.value.path ||
       (report.data.debugger.status === "available") !==
-        input.data.include_debugger_context
+        input.value.include_debugger_context
     )
       return err(
         new AnalysisOutputError(
@@ -97,33 +80,39 @@ export class RecordedCrashService {
       );
     const value = report.data;
     return completeProviderEvidence(
-      ok(
-        createEvidence(
-          {
-            path: value.artifact.path,
-            format: "elf",
-            architecture:
-              RECORDED_LINUX_CORE_PROFILES[value.architecture]
-                .evidenceArchitecture,
-            sha256: value.artifact.sha256,
+      createEvidence(
+        {
+          path: value.artifact.path,
+          format: "elf",
+          architecture:
+            RECORDED_LINUX_CORE_PROFILES[value.architecture]
+              .evidenceArchitecture,
+          sha256: value.artifact.sha256,
+        },
+        this.provider.identity,
+        {
+          operation: OPERATION,
+          parameters: {
+            path: input.value.path,
+            include_debugger_context: input.value.include_debugger_context,
+            ...(input.value.producer_limits === undefined
+              ? {}
+              : { producer_limits: input.value.producer_limits }),
+            ...(input.value.pwntools_timeout_ms === undefined
+              ? {}
+              : { pwntools_timeout_ms: input.value.pwntools_timeout_ms }),
           },
-          this.provider.identity,
-          {
-            operation: OPERATION,
-            parameters: input.data,
-            result: value,
-            // The decoded report is the only representation; do not repeat it.
-            rawResult: null,
-            confidence:
-              value.debugger.status === "available" ? "derived" : "observed",
-            limitations: value.limitations,
-            locations: [{ kind: "artifact-path", path: value.artifact.path }],
-          },
-        ),
+          result: value,
+          // The decoded report is the only representation; do not repeat it.
+          rawResult: null,
+          confidence:
+            value.debugger.status === "available" ? "derived" : "observed",
+          limitations: value.limitations,
+          locations: [{ kind: "artifact-path", path: value.artifact.path }],
+        },
       ),
-      OPERATION,
-      options,
-      outputOptions,
+      options?.signal,
+      outputOptions?.capturedOutput,
     );
   }
 }

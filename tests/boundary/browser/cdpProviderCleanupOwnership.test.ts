@@ -1,4 +1,4 @@
-import { rm, writeFile } from "node:fs/promises";
+import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 
@@ -52,7 +52,6 @@ it.each([
         | undefined;
       if (closeProvider !== undefined) await closeProvider.call(provider);
       await browser.close();
-      await rm(root, { recursive: true, force: true });
     });
 
     const close = vi
@@ -105,8 +104,12 @@ it.each([
         cleanupIncomplete: true,
         cleanupResources: expect.arrayContaining(["electron-page"]),
         partialObservation: {
-          target: { target_id: "electron-page", file_path: page },
-          dom: { total_nodes: expect.any(Number) },
+          kind: "electron-page-observation",
+          cleanup: "incomplete",
+          inspection: {
+            target: { target_id: "electron-page", file_path: page },
+            dom: { total_nodes: expect.any(Number) },
+          },
         },
       });
     }
