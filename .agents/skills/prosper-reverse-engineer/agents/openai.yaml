@@ -1,0 +1,4 @@
+interface:
+  display_name: "PROSPER Reverse Engineer"
+  short_description: "Inspect apps and rebuild verified PROSPER workflows"
+  default_prompt: "Use $prosper-reverse-engineer to inspect this app, recreate its useful workflows for PROSPER, and verify the result on mobile."
