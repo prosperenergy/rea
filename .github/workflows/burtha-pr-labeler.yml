@@ -34,4 +34,4 @@ jobs:
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
           configuration-path: .github/labeler.yml
-          sync-labels: false   # only add, never remove existing labels
+          sync-labels: false # only add, never remove existing labels
